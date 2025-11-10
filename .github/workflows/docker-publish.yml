@@ -33,6 +33,6 @@ jobs:
           context: . # Dockerfile 所在目录，默认为仓库根目录
           push: true # 设置为 true 以推送镜像
           tags: |
-            codename-test/wework-ip-updater:latest
-            codename-test/wework-ip-updater:${{ github.ref_name }}
+            codenametest/wework-ip-updater:latest
+            codenametest/wework-ip-updater:${{ github.ref_name }}
           labels: ${{ steps.meta.outputs.labels }}
