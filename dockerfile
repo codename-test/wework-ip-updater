@@ -109,13 +109,30 @@ RUN set -e; \
 # 从构建阶段复制已安装的Python依赖
 COPY --from=builder /root/.local /root/.local
 
-# 创建虚拟显示启动脚本
+# 创建虚拟显示启动脚本并添加配置文件创建逻辑
 RUN printf '#!/bin/bash\n\
 set -e\n\
 # 启动虚拟显示\n\
 Xvfb :99 -screen 0 3840x2160x24 -ac +extension GLX +render -noreset >/dev/null 2>&1 &\n\
 # 设置DISPLAY变量\n\
 export DISPLAY=:99\n\
+# 检查配置文件是否存在，不存在则创建\n\
+if [ ! -f /app/updater-config.json ]; then\n\
+    echo "创建默认配置文件: /app/updater-config.json"\n\
+    cat > /app/updater-config.json << EOF\n\
+{\n\
+    "Settings": {\n\
+        "wechatUrl":"",\n\
+        "cookie_header": "",\n\
+        "detailsTime": 300,\n\
+        "webhook_url": "https://your-webhook-url",\n\
+        "error_report_file": "error_report.json"\n\
+    }\n\
+}\n\
+EOF\n\
+else\n\
+    echo "配置文件已存在: /app/updater-config.json"\n\
+fi\n\
 # 执行后续命令\n\
 exec "$@"' > /entrypoint.sh && \
     chmod +x /entrypoint.sh
