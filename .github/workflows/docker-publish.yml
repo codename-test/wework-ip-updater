@@ -4,8 +4,8 @@ on:
   push:
     tags:
       - 'v*' # 推送以 'v' 开头的标签时触发，例如 v1.0.0
-    #branches:
-      #- main # 推送到 main 分支时也触发（可选，根据你的发布习惯）
+    branches:
+      - main # 推送到 main 分支时也触发（可选，根据你的发布习惯）
 
 jobs:
   build-and-push:
