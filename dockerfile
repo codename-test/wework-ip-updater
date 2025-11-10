@@ -37,14 +37,11 @@ RUN set -e; \
 # 升级pip
 RUN pip install --no-cache-dir --upgrade pip --timeout 120 --retries 5
 
-# 安装Python依赖
+# 复制requirements文件并安装Python依赖
+COPY requirements.txt .
 RUN set -e; \
     for i in 1 2 3 4 5; do \
-        pip install --user --no-cache-dir --timeout 120 --retries 5 \
-        requests \
-        selenium \
-        pyvirtualdisplay \
-        webdriver-manager \
+        pip install --user --no-cache-dir --timeout 120 --retries 5 -r requirements.txt \
         && break || sleep $(($i * 15)); \
     done
 
