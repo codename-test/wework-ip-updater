@@ -1,0 +1,9 @@
+{
+    "Settings": {
+        "wechatUrl":"",
+        "cookie_header": "",
+        "detailsTime": 300,
+        "webhook_url": "https://your-webhook-url",
+        "error_report_file": "error_report.json"
+    }
+}
