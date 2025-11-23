@@ -1,6 +1,6 @@
 基于https://github.com/suraxiuxiu/WeworkAutoIpConfig
 
-做了一点微调,把配置部分独立了出来,留了个报警接口,使用前自己映射下配置文件updater-config.json到/app里面,或者首次运行以后会自动创建,改了重新启动也行
+做了一点微调,把配置部分独立了出来,留了个报警接口,使用前自己映射下配置文件updater-config.json到/app里面
 
 "wechatUrl":"",---#应用网址
 
