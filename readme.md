@@ -1,6 +1,14 @@
 基于https://github.com/suraxiuxiu/WeworkAutoIpConfig
 
-做了一点微调,把配置部分独立了出来,留了个报警接口,使用前自己映射下配置文件updater-config.json到/app里面,或者首次运行以后会自动创建,改了重新启动也行
+做了一点微调,把配置部分独立了出来,留了个报警接口,映射一个文件夹到app/config,首次运行以后会创建配置模板
+
+(自己配置updater-config.json以后映射过去也可以)
+
+"interface1_interface": "",----接口1,优先尝试电信线路
+
+"interface2_interface": "",,----接口1,优先尝试联通线路
+
+"interface3_interface": "",,----接口1,优先尝试移动线路
 
 "wechatUrl":"",---#应用网址
 
@@ -13,6 +21,28 @@
 "error_report_file": "error_report.json"---#固定格式,没需求就不改了
 
 
-1.0版本针对单网卡,2.0可以多网卡(我自己的负载均衡也不能保证获取正确,但至少有机会取到正常IP,可能是网络环境问题)
 
-2.0配置开头的三个IP就按自己网卡实际获取的填,可以重复不能留空,然后稍微比1.0优化了一点点无关痛痒的东西,普通用户1.0即可
+配置模板
+{
+
+    "Settings": {
+
+        "interface1_interface": "eth0",
+
+        "interface2_interface": "eth1",
+
+        "interface3_interface": "eth2",
+
+        "wechatUrl":"",
+
+        "cookie_header": "",
+
+        "detailsTime": 300,
+
+        "webhook_url": "https://your-webhook-url",
+
+        "error_report_file": "error_report.json"
+
+    }
+
+}
