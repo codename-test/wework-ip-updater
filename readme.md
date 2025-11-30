@@ -1,6 +1,5 @@
 基于https://github.com/suraxiuxiu/WeworkAutoIpConfig
 
-<<<<<<< HEAD
 做了一点微调,把配置部分独立了出来,留了个报警接口,映射一个文件夹到app/config,首次运行以后会创建配置模板
 
 (自己配置updater-config.json以后映射过去也可以)
@@ -10,9 +9,6 @@
 "interface2_interface": "",,----接口1,优先尝试联通线路
 
 "interface3_interface": "",,----接口1,优先尝试移动线路
-=======
-做了一点微调,把配置部分独立了出来,留了个报警接口,使用前自己映射下配置文件updater-config.json到/app里面
->>>>>>> d7676165f2814c5b1fab91b8eeeee5233d2c4f92
 
 "wechatUrl":"",---#应用网址
 
