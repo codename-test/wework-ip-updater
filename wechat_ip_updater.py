@@ -173,9 +173,9 @@ IP_SERVICES_BY_ISP = {
 
 # 为每个接口分配不同的运营商优先级（按照您的要求）
 INTERFACE_ISP_PRIORITY = {
-    0: ["telecom", "international", "unicom", "mobile", "edu"],  # 接口1：优先电信
-    1: ["unicom", "international", "telecom", "mobile", "edu"],  # 接口2：优先联通  
-    2: ["mobile", "international", "telecom", "unicom", "edu"]   # 接口3：优先移动
+    0: ["telecom", "unicom", "mobile", "international", "edu"],  # 接口1：优先电信
+    1: ["unicom", "telecom", "mobile", "international", "edu"],  # 接口2：优先联通  
+    2: ["mobile", "telecom", "unicom", "international", "edu"]   # 接口3：优先移动
 }
 
 def get_isp_services_for_interface(interface_index):
