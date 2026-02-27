@@ -1,3 +1,5 @@
+镜像地址:ghcr.io/codename-test/wework-ip-updater:latest
+
 基于https://github.com/suraxiuxiu/WeworkAutoIpConfig
 
 做了一点微调,把配置部分独立了出来,留了个报警接口,映射一个文件夹到app/config,首次运行以后会创建配置模板
