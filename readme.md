@@ -27,24 +27,16 @@
 配置模板
 {
 
+    {
     "Settings": {
-
         "interface1_interface": "eth0",
-
         "interface2_interface": "eth1",
-
         "interface3_interface": "eth2",
-
         "wechatUrl":"",
-
         "cookie_header": "",
-
         "detailsTime": 300,
-
         "webhook_url": "https://your-webhook-url",
-
         "error_report_file": "error_report.json"
-
+        }
     }
-
 }
