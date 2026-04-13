@@ -1,4 +1,4 @@
-import re
+﻿import re
 import json
 import subprocess
 from selenium import webdriver
@@ -110,6 +110,9 @@ detailsTime = config['Settings']['detailsTime']
 # 错误报告配置
 webhook_url = config['Settings'].get('webhook_url', '')
 error_report_file = config['Settings'].get('error_report_file', 'error_report.json')
+
+# 全局状态变量
+last_error_time = None  # 记录上次错误推送时间（全局）
 
 # Chrome配置
 CHROME_MAX_RETRIES = 3
@@ -340,7 +343,7 @@ def get_ip_using_curl_source_binding(interface_ip, display_name, interface_index
                         continue
                     ip = ip_match.group()
                 
-                if is_valid_ip(ip):
+                if is_valid_ip(ip) and is_public_ip(ip):
                     # 获取服务所属运营商用于日志
                     isp_name = "未知"
                     for isp, services in IP_SERVICES_BY_ISP.items():
@@ -529,23 +532,47 @@ def is_valid_ip(ip):
             
     return True
 
+def is_public_ip(ip):
+    """检查IP是否为公网IP（排除私有IP和特殊IP）"""
+    if not is_valid_ip(ip):
+        return False
+    
+    # 私有IP范围
+    octets = [int(x) for x in ip.split('.')]
+    
+    # 10.0.0.0/8
+    if octets[0] == 10:
+        return False
+    
+    # 172.16.0.0/12
+    if octets[0] == 172 and 16 <= octets[1] <= 31:
+        return False
+    
+    # 192.168.0.0/16
+    if octets[0] == 192 and octets[1] == 168:
+        return False
+    
+    # 127.0.0.0/8 (回环地址)
+    if octets[0] == 127:
+        return False
+    
+    # 169.254.0.0/16 (链路本地地址)
+    if octets[0] == 169 and octets[1] == 254:
+        return False
+    
+    return True
+
 def send_error_report(error_message):
-    """发送错误报告到Webhook，并确保24小时内只发送一次"""
+    """发送错误报告到Webhook，使用全局last_error_time限流（24小时）"""
+    global last_error_time
+    
     if not webhook_url:
         log_with_timestamp("Webhook URL未配置，跳过错误报告")
         return
     
-    last_sent_time = None
-    if os.path.exists(error_report_file):
-        try:
-            with open(error_report_file, 'r') as f:
-                report_data = json.load(f)
-                last_sent_time = datetime.fromisoformat(report_data['last_sent'])
-        except Exception as e:
-            log_with_timestamp(f"读取错误报告文件失败: {e}")
-    
     current_time = datetime.now()
-    if last_sent_time and current_time - last_sent_time < timedelta(hours=24):
+    # 检查是否在24小时内已发送（使用全局变量，避免重复限流）
+    if last_error_time and (current_time - last_error_time).total_seconds() < 86400:
         log_with_timestamp("24小时内已发送过错误报告，本次跳过")
         return
     
@@ -565,13 +592,12 @@ def send_error_report(error_message):
         )
         
         if response.status_code == 200:
-            log_with_timestamp("错误报告发送成功")
-            with open(error_report_file, 'w') as f:
-                json.dump({'last_sent': current_time.isoformat()}, f)
+            log_with_timestamp("✅ 错误报告发送成功")
+            last_error_time = current_time  # 更新全局错误时间
         else:
-            log_with_timestamp(f"错误报告发送失败，状态码: {response.status_code}, 响应: {response.text}")
+            log_with_timestamp(f"⚠️ 错误报告发送失败，状态码: {response.status_code}, 响应: {response.text}")
     except Exception as e:
-        log_with_timestamp(f"发送错误报告时出错: {e}")
+        log_with_timestamp(f"❌ 发送错误报告时出错: {e}")
 
 
 
@@ -585,7 +611,7 @@ def send_recovery_report():
     payload = {
         "msgtype": "text",
         "text": {
-            "content": f"🟢 企业微信 IP 更新器已恢复\n\n服务已恢复正常运行\n时间：{current_time.strftime('%Y-%m-%d %H:%M:%S')}\n\n系统状态正常"
+            "content": f"✅ 企业微信 IP 更新器已恢复\n\n✅ 所有接口检测正常，服务恢复正常运行\n⏰ 时间：{current_time.strftime('%Y-%m-%d %H:%M:%S')}\n\n系统状态：正常"
         }
     }
     
@@ -598,11 +624,46 @@ def send_recovery_report():
         )
         
         if response.status_code == 200:
-            log_with_timestamp("恢复通知发送成功")
+            log_with_timestamp("✅ 恢复通知发送成功")
         else:
-            log_with_timestamp(f"恢复通知发送失败，状态码：{response.status_code}, 响应：{response.text}")
+            log_with_timestamp(f"⚠️ 恢复通知发送失败，状态码：{response.status_code}, 响应：{response.text}")
     except Exception as e:
-        log_with_timestamp(f"发送恢复通知时出错：{e}")
+        log_with_timestamp(f"❌ 发送恢复通知时出错：{e}")
+
+
+def send_error_report_ip_check(interface_name, error_details, is_first_error=False):
+    """发送IP检测失败的错误报告到Webhook"""
+    if not webhook_url:
+        log_with_timestamp("Webhook URL未配置，跳过IP检测错误报告")
+        return
+    
+    current_time = datetime.now()
+    
+    # 构建错误详情
+    interface_desc = ["接口1", "接口2", "接口3"].get(interface_name if interface_name else "未知")
+    error_type = "首次检测失败" if is_first_error else "持续检测失败"
+    
+    payload = {
+        "msgtype": "text",
+        "text": {
+            "content": f"⚠️ IP检测失败告警\n\n📍 接口：{interface_desc or '未知'}\n❌ 错误类型：{error_type}\n📋 错误详情：{error_details}\n⏰ 时间：{current_time.strftime('%Y-%m-%d %H:%M:%S')}"
+        }
+    }
+    
+    try:
+        response = requests.post(
+            webhook_url,
+            json=payload,
+            headers={'Content-Type': 'application/json'},
+            timeout=10
+        )
+        
+        if response.status_code == 200:
+            log_with_timestamp(f"⚠️ IP检测失败报告发送成功（{interface_desc}）")
+        else:
+            log_with_timestamp(f"⚠️ IP检测失败报告发送失败，状态码: {response.status_code}, 响应: {response.text}")
+    except Exception as e:
+        log_with_timestamp(f"❌ 发送IP检测失败报告时出错: {e}")
 
 def setup_chrome_options():
     """优化的Chrome选项设置"""
@@ -818,23 +879,37 @@ def OpenBrowser():
     
     return None
 
-def ChangeIP(driver, new_ips):
+def ChangeIP(driver, new_ips, error_reported_flag):
     """更新企业微信可信IP地址"""
+    change_success = False
+    new_error_reported_flag = error_reported_flag
+    
     try:
         log_with_timestamp("尝试更改企业微信可信IP地址")
         
-        # 准备要设置的IP内容
-        valid_ips = [ip for ip in new_ips if ip != "获取IP失败"]
-        if not valid_ips:
-            log_with_timestamp("没有有效的IP地址可以设置")
-            return
-            
-        # 去重处理
-        unique_ips = list(set(valid_ips))
+        # 准备要设置的IP内容（保留顺序 + 去重：只保留首次出现的IP）
+        valid_ips = [ip for ip in new_ips if ip != "获取IP失败" and not ip.startswith(('192.168.', '10.', '172.16.', '172.17.', '172.18.', '172.19.', '172.20.', '172.21.', '172.22.', '172.23.', '172.24.', '172.25.', '172.26.', '172.27.', '172.28.', '172.29.', '172.30.', '172.31.', '127.0.0.', '169.254.'))]
+        
+        # 保留顺序去重：只保留首次出现的IP
+        unique_ips = []
+        seen_ips = set()
+        for ip in valid_ips:
+            if ip not in seen_ips:
+                unique_ips.append(ip)
+                seen_ips.add(ip)
+        
+        if not unique_ips:
+            error_msg = "没有有效的公网IP地址可以设置（所有IP都是私有IP或本地回环）"
+            log_with_timestamp(error_msg)
+            if not error_reported_flag:
+                send_error_report(error_msg)
+                new_error_reported_flag = True
+            return new_error_reported_flag, change_success
+        
         new_ips_str = ';'.join(unique_ips)
         
         if len(unique_ips) < len(valid_ips):
-            log_with_timestamp(f"检测到重复IP，去重后设置: {new_ips_str}")
+            log_with_timestamp(f"检测到重复IP，去重后设置: {new_ips_str} (原始: {len(valid_ips)}个 → 唯一: {len(unique_ips)}个)")
         
         settings_button = WebDriverWait(driver, 10).until(
             EC.element_to_be_clickable((By.XPATH, '//div[contains(@class, "app_card_operate") and contains(@class, "js_show_ipConfig_dialog")]'))
@@ -882,9 +957,11 @@ def ChangeIP(driver, new_ips):
             WebDriverWait(driver, 5).until(
                 EC.invisibility_of_element_located((By.XPATH, '//div[contains(@class, "js_ipConfig_dialog")]'))
             )
-            log_with_timestamp("IP地址更新成功")
+            log_with_timestamp("✅ IP地址更新成功")
+            change_success = True
         except TimeoutException:
             log_with_timestamp("警告：未检测到对话框关闭，但操作可能已完成")
+            change_success = True
         
     except TimeoutException:
         error_msg = "操作超时，未能找到页面元素"
@@ -898,12 +975,12 @@ def ChangeIP(driver, new_ips):
         except:
             log_with_timestamp("无法保存截图")
         send_error_report(error_msg)
-        error_reported = True  # 标记已发送错误报告
+        new_error_reported_flag = True
     except NoSuchElementException:
         error_msg = "页面元素不存在"
         log_with_timestamp(error_msg)
         send_error_report(error_msg)
-        error_reported = True  # 标记已发送错误报告
+        new_error_reported_flag = True
     except Exception as e:
         error_msg = f"更改IP地址失败: {e}"
         log_with_timestamp(error_msg)
@@ -916,7 +993,9 @@ def ChangeIP(driver, new_ips):
         except:
             log_with_timestamp("无法保存截图")
         send_error_report(error_msg)
-        error_reported = True  # 标记已发送错误报告
+        new_error_reported_flag = True
+    
+    return new_error_reported_flag, change_success
 
 # 主程序循环
 def main():
@@ -947,7 +1026,8 @@ def main():
     
     # 运行主循环 - 永不停止，只推送不重复
     last_error_time = None  # 记录上次错误推送时间
-    service_running = True  # 服务运行状态标记
+    service_running = False  # 服务运行状态标记（初始False，第一次恢复就会触发通知）
+    error_reported_flag = False  # 错误报告已发送标记
     
     while True:
         driver = None
@@ -977,7 +1057,8 @@ def main():
             # 如果有任一接口IP发生变化，则更新企业微信设置
             if changed:
                 log_with_timestamp("检测到IP变化，开始更新企业微信设置")
-                ChangeIP(driver, new_ips)
+                # 修复：传入 error_reported_flag 参数，并捕获返回值
+                error_reported_flag, change_success = ChangeIP(driver, new_ips, error_reported_flag)
                 
                 # 更新后记录最终状态
                 for i, ip in enumerate(current_ips):
@@ -993,19 +1074,12 @@ def main():
         except Exception as e:
             error_msg = f"主循环发生错误：{e}"
             log_with_timestamp(error_msg)
+            send_error_report(error_msg)
+            service_running = False  # 标记服务异常
 
-            # 检查是否需要发送错误报告（24 小时限流）
-            current_time = datetime.now()
-            if last_error_time is None or (current_time - last_error_time).total_seconds() > 86400:
-                send_error_report(error_msg)
-                last_error_time = current_time
-                service_running = False  # 标记服务异常
-            else:
-                log_with_timestamp("24 小时内已发送过错误报告，跳过推送")
-
-            # 等待 15 秒后继续，永不停止
-            log_with_timestamp("等待 15 秒后继续运行...")
-            time.sleep(15)
+            # 等待配置的刷新间隔后继续，永不停止
+            log_with_timestamp(f"等待 {detailsTime} 秒后继续运行...")
+            time.sleep(detailsTime)
         finally:
             if driver:
                 try:
