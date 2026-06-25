@@ -303,28 +303,31 @@ def get_public_ip_via_requests(source_ip: str, interface_index: int) -> str | No
             return super().init_poolmanager(*args, **kwargs)
 
     session = requests.Session()
-    adapter = SourceBindingAdapter(source_ip)
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
+    try:
+        adapter = SourceBindingAdapter(source_ip)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                       "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-    }
-    services = build_service_list(interface_index)
-    for url, isp_key in services:
-        try:
-            resp = session.get(url, headers=headers, timeout=10)
-            if resp.status_code != 200:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                           "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+        }
+        services = build_service_list(interface_index)
+        for url, isp_key in services:
+            try:
+                resp = session.get(url, headers=headers, timeout=10)
+                if resp.status_code != 200:
+                    continue
+                ip = parse_ip_response(url, resp.text)
+                if ip and is_valid_ip(ip) and is_public_ip(ip):
+                    isp_name = ISP_NAMES.get(isp_key, isp_key)
+                    label = INTERFACE_LABELS[interface_index]
+                    log.info("%s IP (requests): %s (运营商: %s)", label, ip, isp_name)
+                    return ip
+            except Exception:
                 continue
-            ip = parse_ip_response(url, resp.text)
-            if ip and is_valid_ip(ip) and is_public_ip(ip):
-                isp_name = ISP_NAMES.get(isp_key, isp_key)
-                label = INTERFACE_LABELS[interface_index]
-                log.info("%s IP (requests): %s (运营商: %s)", label, ip, isp_name)
-                return ip
-        except Exception:
-            continue
+    finally:
+        session.close()
     return None
 
 
@@ -630,6 +633,34 @@ class Notifier:
             self._last_cycle_ok = False
 
 
+# ==================== Cookie 保活 ====================
+def keep_cookie_alive(wechat_url: str, cookie_header: str) -> bool:
+    """
+    用 requests 轻量请求访问企业微信页面，保持 cookie/session 不过期。
+    不启动浏览器，内存开销极小（几 MB）。
+    返回 True 表示 cookie 仍有效，False 表示已失效。
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+        "Cookie": cookie_header,
+    }
+    try:
+        resp = requests.get(wechat_url, headers=headers, timeout=15, allow_redirects=True)
+        # 如果被重定向到登录页，说明 cookie 已失效
+        if "loginpage_wx" in resp.url or "login" in resp.url.lower():
+            log.warning("Cookie 已失效（被重定向到登录页）")
+            return False
+        if resp.status_code == 200:
+            log.info("Cookie 保活成功（HTTP %d）", resp.status_code)
+            return True
+        log.warning("Cookie 保活异常，HTTP 状态码: %d", resp.status_code)
+        return False
+    except Exception as e:
+        log.warning("Cookie 保活请求失败: %s", e)
+        return False
+
+
 # ==================== 主循环 ====================
 def main():
     config = load_config()
@@ -660,33 +691,51 @@ def main():
         return
 
     while True:
-        driver = None
         cycle_ok = False
         error_detail = ""
         start_time = time.time()
 
         try:
-            driver = launch_browser(wechat_url, cookie_header)
-            if not driver:
-                error_detail = "浏览器启动失败（重试3次后仍失败）"
+            # 第零步：用轻量请求保活 cookie（不启动浏览器，几 MB 内存）
+            cookie_ok = keep_cookie_alive(wechat_url, cookie_header)
+            if not cookie_ok:
+                error_detail = "Cookie 已失效，请更新配置文件中的 cookie_header"
                 log.error(error_detail)
+                notifier.on_cycle_result(False, error_detail)
+                time.sleep(interval)
+                continue
+
+            # 第一步：检测 IP（不需要浏览器）
+            try:
+                new_ips = detect_all_interface_ips(interface_configs)
+            except Exception as e:
+                error_detail = f"IP检测异常: {e}"
+                log.error(error_detail)
+                notifier.on_cycle_result(False, error_detail)
+                time.sleep(interval)
+                continue
+
+            # 判断是否有变化
+            changed = any(
+                new_ip is not None and new_ip != current_ips[i]
+                for i, new_ip in enumerate(new_ips)
+            )
+
+            if not changed:
+                cycle_ok = True
+                log.info("所有接口IP均未变化，无需更新")
             else:
+                # 第二步：IP 有变化，才启动浏览器去更新企业微信
+                log.info("检测到IP变化，启动浏览器更新企业微信")
+                driver = None
                 try:
-                    new_ips = detect_all_interface_ips(interface_configs)
-                except Exception as e:
-                    error_detail = f"IP检测异常: {e}"
-                    log.error(error_detail)
-                else:
-                    # 判断是否有变化
-                    changed = any(
-                        new_ip is not None and new_ip != current_ips[i]
-                        for i, new_ip in enumerate(new_ips)
-                    )
-                    if changed:
-                        log.info("检测到IP变化，开始更新企业微信")
+                    driver = launch_browser(wechat_url, cookie_header)
+                    if not driver:
+                        error_detail = "浏览器启动失败（重试3次后仍失败）"
+                        log.error(error_detail)
+                    else:
                         ok, err = update_wecom_ip(driver, new_ips)
                         if ok:
-                            # 更新缓存
                             for i, ip in enumerate(new_ips):
                                 if ip is not None:
                                     current_ips[i] = ip
@@ -695,9 +744,13 @@ def main():
                         else:
                             error_detail = err
                             log.error("IP变更失败: %s", err)
-                    else:
-                        cycle_ok = True
-                        log.info("所有接口IP均未变化，无需更新")
+                finally:
+                    if driver:
+                        try:
+                            driver.quit()
+                        except Exception:
+                            pass
+                        cleanup_chrome_processes()
 
             notifier.on_cycle_result(cycle_ok, error_detail)
 
@@ -705,14 +758,6 @@ def main():
             error_detail = f"主循环异常: {e}"
             log.error(error_detail)
             notifier.on_cycle_result(False, error_detail)
-
-        finally:
-            if driver:
-                try:
-                    driver.quit()
-                except Exception:
-                    pass
-                cleanup_chrome_processes()
 
         elapsed = time.time() - start_time
         log.info("本次循环耗时 %.1fs，等待 %ds 后下次检查...", elapsed, interval)
