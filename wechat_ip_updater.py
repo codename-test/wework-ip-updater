@@ -1,705 +1,723 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import re
+"""
+企业微信可信IP自动更新器
+监测多条线路的公网IP，变化时通过 Selenium 更新企业微信后台配置。
+"""
+
+import ipaddress
 import json
-import subprocess
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, NoSuchElementException, WebDriverException
-from selenium.webdriver.chrome.service import Service
-import time
+import logging
 import os
-import requests
-from datetime import datetime, timedelta
-import socket
 import platform
-import netifaces
 import random
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
 
-# ==================== 工具函数 ====================
-def get_timestamp():
-    """获取当前时间戳"""
-    return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+import requests
+from selenium import webdriver
+from selenium.common.exceptions import TimeoutException, WebDriverException
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
 
-def log_with_timestamp(message):
-    """带时间戳的日志输出"""
-    print(f"[{get_timestamp()}] {message}")
+try:
+    import netifaces
+except ImportError:
+    netifaces = None
 
-def create_default_config():
-    """创建默认配置文件"""
-    default_config = {
-        "Settings": {
-            "interface1_interface": "eth0",
-            "interface2_interface": "eth1", 
-            "interface3_interface": "eth2",
-            "wechatUrl": "https://work.weixin.qq.com/wework_admin/loginpage_wx",
-            "cookie_header": "your_cookie_here",
-            "detailsTime": 300,
-            "webhook_url": "",
-            "error_report_file": "error_report.json"
-        }
-    }
-    config_dir = 'config'
-    if not os.path.exists(config_dir):
-        os.makedirs(config_dir)
-        log_with_timestamp(f"创建配置目录: {config_dir}")
-    config_path = os.path.join(config_dir, 'updater-config.json')
-    try:
-        with open(config_path, 'w', encoding='utf-8') as f:
-            json.dump(default_config, f, ensure_ascii=False, indent=4)
-        log_with_timestamp(f"已创建默认配置文件: {config_path}")
-        log_with_timestamp("请编辑配置文件并设置正确的参数后重新运行程序")
-        return True
-    except Exception as e:
-        log_with_timestamp(f"创建配置文件失败: {e}")
-        return False
+# ==================== 日志配置 ====================
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger(__name__)
 
-def load_config():
-    """加载配置文件，如果不存在则创建默认配置"""
-    config_path = 'config/updater-config.json'
-    if not os.path.exists(config_path):
-        log_with_timestamp("配置文件不存在，正在创建默认配置...")
-        if create_default_config():
-            exit(0)
-        else:
-            log_with_timestamp("创建配置文件失败，程序退出")
-            exit(1)
-    try:
-        with open(config_path, 'r', encoding='utf-8') as f:
-            config = json.load(f)
-        log_with_timestamp("配置文件加载成功")
-        return config
-    except Exception as e:
-        log_with_timestamp(f"加载配置文件失败: {e}")
-        if create_default_config():
-            exit(0)
-        else:
-            exit(1)
+# ==================== 常量 ====================
+IP_PATTERN = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+ISP_NAMES = {
+    "telecom": "电信", "unicom": "联通", "mobile": "移动",
+    "edu": "教育网", "international": "国际",
+}
+INTERFACE_LABELS = ["电信线路", "联通线路", "移动线路"]
 
-# 读取JSON配置文件
-config = load_config()
-
-# 从配置文件获取参数
-ip_pattern = r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b'
-
-# 从配置文件获取三个网卡接口名称
-interface_configs = [
-    {'interface': config['Settings']['interface1_interface']},
-    {'interface': config['Settings']['interface2_interface']},
-    {'interface': config['Settings']['interface3_interface']}
-]
-
-# 当前IP地址存储
-current_ips = ['192.168.1.1', '192.168.1.1', '192.168.1.1']
-overwrite = True
-wechatUrl = config['Settings']['wechatUrl']
-cookie_header = config['Settings']['cookie_header']
-detailsTime = config['Settings']['detailsTime']
-
-# 错误报告配置
-webhook_url = config['Settings'].get('webhook_url', '')
-error_report_file = config['Settings'].get('error_report_file', 'error_report.json')
-
-# Chrome配置
-CHROME_MAX_RETRIES = 3
-CHROME_RETRY_DELAY = 5
-
-# 按运营商分类的IP检测服务
+# 按运营商分类的 IP 检测服务
 IP_SERVICES_BY_ISP = {
     "telecom": [
         "https://ip.3322.net",
         "http://www.net.cn/static/customercare/yourip.asp",
         "http://ddns.oray.com/checkip",
-        "http://ip.cctv.cn",
-        "https://myip.lefeng.com",
-        "http://ip.taobao.com/service/getIpInfo2.php?ip=myip",
-        "https://www.taobao.com/help/getip.php"
+        "http://members.3322.org/dyndns/getip",
     ],
     "unicom": [
         "http://www.ipplus360.com/getip",
-        "http://members.3322.org/dyndns/getip",
-        "http://ip.taobao.com/service/getIpInfo2.php?ip=myip",
+        "https://ip.ustc.edu.cn",
         "https://www.ip.cn/api/index?ip=&type=0",
-        "http://ip.uniqode.net",
-        "https://ip.ustc.edu.cn"
     ],
     "mobile": [
         "http://ip.chinamobile.com",
         "http://1212.ip138.com/ic.asp",
         "https://www.ip138.com/ip2city.asp",
-        "http://ip.cmvideo.cn",
-        "http://ip.mobilem.360.cn",
-        "http://ip.10086.cn",
-        "http://ip.monternet.com",
-        "https://ip.ct10000.com"
-    ],
-    "edu": [
-        "http://www.edu.cn/",
-        "http://www.cernet.com/",
-        "https://ip.ustc.edu.cn"
     ],
     "international": [
         "http://ipv4.icanhazip.com",
-        "https://4.ipw.cn", 
+        "https://4.ipw.cn",
         "http://checkip.amazonaws.com",
         "https://api.ipify.org",
-        "http://myexternalip.com/raw",
         "http://ifconfig.me/ip",
-        "http://ident.me",
         "http://ipecho.net/plain",
-        "http://whatismyip.akamai.com",
-        "http://wgetip.com"
-    ]
+    ],
 }
 
+# 每个接口按优先级排列的运营商
 INTERFACE_ISP_PRIORITY = {
-    0: ["telecom", "international", "unicom", "mobile", "edu"],
-    1: ["unicom", "international", "telecom", "mobile", "edu"],
-    2: ["mobile", "international", "telecom", "unicom", "edu"]
+    0: ["telecom", "international", "unicom", "mobile"],
+    1: ["unicom", "international", "telecom", "mobile"],
+    2: ["mobile", "international", "telecom", "unicom"],
 }
 
-# ==================== IP检测相关函数 ====================
-def get_system_platform():
-    system = platform.system().lower()
-    if system == 'windows':
-        return 'windows'
-    elif system == 'linux':
-        return 'linux'
-    elif system == 'darwin':
-        return 'macos'
-    else:
-        return 'unknown'
+# Chrome 重试配置
+CHROME_MAX_RETRIES = 3
+CHROME_RETRY_DELAY = 5
 
-def check_command_available(command):
-    try:
-        if get_system_platform() == 'windows':
-            result = subprocess.run(['where', command] if command != 'ip' else ['where', 'ipconfig'], capture_output=True, text=True, timeout=5)
-        else:
-            result = subprocess.run(['which', command], capture_output=True, text=True, timeout=5)
-        return result.returncode == 0
-    except Exception:
-        return False
+# 错误/恢复通知限流（秒）
+NOTIFICATION_COOLDOWN = 86400  # 24h
 
-def check_curl_available():
+
+# ==================== 配置管理 ====================
+CONFIG_DIR = Path("config")
+CONFIG_PATH = CONFIG_DIR / "updater-config.json"
+
+DEFAULT_CONFIG = {
+    "Settings": {
+        "interface1_interface": "eth0",
+        "interface2_interface": "eth1",
+        "interface3_interface": "eth2",
+        "wechatUrl": "https://work.weixin.qq.com/wework_admin/loginpage_wx",
+        "cookie_header": "your_cookie_here",
+        "detailsTime": 300,
+        "webhook_url": "",
+        "error_report_file": "error_report.json",
+    }
+}
+
+
+def create_default_config() -> bool:
+    """创建默认配置文件"""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     try:
-        result = subprocess.run(['curl', '--version'], capture_output=True, text=True, timeout=5)
-        return result.returncode == 0
+        CONFIG_PATH.write_text(
+            json.dumps(DEFAULT_CONFIG, ensure_ascii=False, indent=4),
+            encoding="utf-8",
+        )
+        log.info("已创建默认配置文件: %s", CONFIG_PATH)
+        log.info("请编辑配置文件并设置正确的参数后重新运行程序")
+        return True
     except Exception as e:
-        log_with_timestamp(f"curl命令检查失败: {e}")
+        log.error("创建配置文件失败: %s", e)
         return False
 
-def get_interface_ip(interface_name):
-    """获取指定网卡接口的IP地址"""
+
+def load_config() -> dict:
+    """加载配置文件，不存在则创建默认配置"""
+    if not CONFIG_PATH.exists():
+        log.info("配置文件不存在，正在创建默认配置...")
+        create_default_config()
+        sys.exit(0)
     try:
+        config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        log.info("配置文件加载成功")
+        return config
+    except Exception as e:
+        log.error("加载配置文件失败: %s", e)
+        if create_default_config():
+            sys.exit(0)
+        sys.exit(1)
+
+
+# ==================== IP 工具函数 ====================
+def is_valid_ip(ip: str) -> bool:
+    """校验是否为合法 IPv4 地址"""
+    try:
+        addr = ipaddress.IPv4Address(ip)
+        return True
+    except (ipaddress.AddressValueError, ValueError):
+        return False
+
+
+def is_public_ip(ip: str) -> bool:
+    """判断是否为公网 IP"""
+    try:
+        addr = ipaddress.IPv4Address(ip)
+        return addr.is_global
+    except (ipaddress.AddressValueError, ValueError):
+        return False
+
+
+def is_private_ip(ip: str) -> bool:
+    """判断是否为私有/保留 IP（用于过滤不应设置的地址）"""
+    try:
+        addr = ipaddress.IPv4Address(ip)
+        # is_global 的反面：私有、回环、链路本地、保留段等
+        return not addr.is_global
+    except (ipaddress.AddressValueError, ValueError):
+        return True
+
+
+def extract_ip_from_text(text: str) -> str | None:
+    """从文本中提取第一个合法 IP"""
+    match = IP_PATTERN.search(text.strip())
+    return match.group() if match else None
+
+
+def extract_ip_from_json_response(data: dict) -> str | None:
+    """从 JSON API 响应中提取 IP 字段"""
+    # 兼容多种 API 返回格式
+    if "ip" in data:
+        return data["ip"]
+    if "data" in data and isinstance(data["data"], dict) and "ip" in data["data"]:
+        return data["data"]["ip"]
+    return None
+
+
+# ==================== 网卡接口 IP 获取 ====================
+def get_interface_ip(interface_name: str) -> str | None:
+    """获取指定网卡接口的内网 IP 地址"""
+    # 方式1: netifaces
+    if netifaces is not None:
         try:
             addresses = netifaces.ifaddresses(interface_name)
-            if netifaces.AF_INET in addresses:
-                for addr_info in addresses[netifaces.AF_INET]:
-                    ip = addr_info.get('addr')
-                    if ip and ip != '127.0.0.1' and not ip.startswith('169.254'):
-                        return ip
-        except (ValueError, KeyError):
+            for addr_info in addresses.get(netifaces.AF_INET, []):
+                ip = addr_info.get("addr")
+                if ip and ip != "127.0.0.1" and not ip.startswith("169.254"):
+                    return ip
+        except (ValueError, KeyError, OSError):
             pass
-        if check_command_available('ip'):
-            try:
-                result = subprocess.run(['ip', '-4', 'addr', 'show', interface_name], capture_output=True, text=True, timeout=5)
-                if result.returncode == 0:
-                    ip_match = re.search(r'inet (\d+\.\d+\.\d+\.\d+)', result.stdout)
-                    if ip_match:
-                        return ip_match.group(1)
-            except Exception:
-                pass
-        if check_command_available('ifconfig'):
-            try:
-                result = subprocess.run(['ifconfig', interface_name], capture_output=True, text=True, timeout=5)
-                if result.returncode == 0:
-                    ip_match = re.search(r'inet (\d+\.\d+\.\d+\.\d+)', result.stdout)
-                    if ip_match:
-                        return ip_match.group(1)
-            except Exception:
-                pass
-        log_with_timestamp(f"无法获取接口 {interface_name} 的IP地址")
-        return None
-    except Exception as e:
-        log_with_timestamp(f"获取接口 {interface_name} IP地址失败: {e}")
-        return None
 
-def get_isp_services_for_interface(interface_index):
-    isp_priority = INTERFACE_ISP_PRIORITY.get(interface_index, ["international", "telecom", "unicom", "mobile"])
+    # 方式2: ip 命令 (Linux)
+    try:
+        result = subprocess.run(
+            ["ip", "-4", "addr", "show", interface_name],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            match = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", result.stdout)
+            if match:
+                return match.group(1)
+    except (FileNotFoundError, Exception):
+        pass
+
+    # 方式3: ifconfig (macOS/旧Linux)
+    try:
+        result = subprocess.run(
+            ["ifconfig", interface_name],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            match = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", result.stdout)
+            if match:
+                return match.group(1)
+    except (FileNotFoundError, Exception):
+        pass
+
+    log.warning("无法获取接口 %s 的IP地址", interface_name)
+    return None
+
+
+# ==================== 公网 IP 检测 ====================
+def build_service_list(interface_index: int) -> list[tuple[str, str]]:
+    """
+    按运营商优先级构建检测服务列表。
+    返回 [(url, isp_key), ...]
+    """
+    priority = INTERFACE_ISP_PRIORITY.get(interface_index, ["international"])
     services = []
-    for isp in isp_priority:
-        if isp in IP_SERVICES_BY_ISP:
-            isp_services = IP_SERVICES_BY_ISP[isp].copy()
-            random.shuffle(isp_services)
-            services.extend(isp_services)
-    isp_names = {"telecom": "电信", "unicom": "联通", "mobile": "移动", "edu": "教育网", "international": "国际"}
-    priority_names = [isp_names.get(isp, isp) for isp in isp_priority if isp in isp_names]
-    interface_desc = ["电信优先", "联通优先", "移动优先"][interface_index]
-    log_with_timestamp(f"接口{interface_index+1}({interface_desc}) 运营商检测优先级: {' → '.join(priority_names)}")
+    for isp in priority:
+        isp_urls = IP_SERVICES_BY_ISP.get(isp, [])
+        shuffled = list(isp_urls)
+        random.shuffle(shuffled)
+        for url in shuffled:
+            services.append((url, isp))
     return services
 
-def get_ip_using_curl_source_binding(interface_ip, display_name, interface_index):
-    isp_services = get_isp_services_for_interface(interface_index)
-    for service_url in isp_services:
+
+def parse_ip_response(url: str, text: str) -> str | None:
+    """统一解析 IP 检测服务的响应"""
+    text = text.strip()
+    if not text:
+        return None
+    # JSON 类 API
+    if "taobao.com" in url or "ip.cn" in url:
         try:
-            cmd = ['curl', '--interface', interface_ip, '--connect-timeout', '8', '--max-time', '12', '--retry', '1', '-s', service_url]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-            if result.returncode == 0:
-                if 'taobao.com' in service_url or 'ip.cn' in service_url:
-                    try:
-                        data = json.loads(result.stdout)
-                        if 'ip' in data:
-                            ip = data['ip']
-                        elif 'data' in data and 'ip' in data['data']:
-                            ip = data['data']['ip']
-                        else:
-                            continue
-                    except:
-                        continue
-                else:
-                    ip_match = re.search(ip_pattern, result.stdout.strip())
-                    if not ip_match:
-                        continue
-                    ip = ip_match.group()
-                if is_valid_ip(ip) and is_public_ip(ip):
-                    isp_name = "未知"
-                    for isp, services in IP_SERVICES_BY_ISP.items():
-                        if service_url in services:
-                            isp_names = {"telecom": "电信", "unicom": "联通", "mobile": "移动", "edu": "教育网", "international": "国际"}
-                            isp_name = isp_names.get(isp, isp)
-                            break
-                    interface_desc = ["电信线路", "联通线路", "移动线路"][interface_index]
-                    log_with_timestamp(f"{interface_desc} {display_name} IP: {ip} (运营商: {isp_name}, 来源: {service_url})")
-                    return ip
+            data = json.loads(text)
+            return extract_ip_from_json_response(data)
+        except (json.JSONDecodeError, KeyError):
+            return None
+    # 纯文本类 API
+    return extract_ip_from_text(text)
+
+
+def get_public_ip_via_curl(source_ip: str, interface_index: int) -> str | None:
+    """通过 curl 绑定源 IP 获取公网 IP"""
+    services = build_service_list(interface_index)
+    for url, isp_key in services:
+        try:
+            result = subprocess.run(
+                [
+                    "curl", "--interface", source_ip,
+                    "--connect-timeout", "8", "--max-time", "12",
+                    "--retry", "1", "-s", url,
+                ],
+                capture_output=True, text=True, timeout=15,
+            )
+            if result.returncode != 0:
+                continue
+            ip = parse_ip_response(url, result.stdout)
+            if ip and is_valid_ip(ip) and is_public_ip(ip):
+                isp_name = ISP_NAMES.get(isp_key, isp_key)
+                label = INTERFACE_LABELS[interface_index]
+                log.info("%s IP: %s (运营商: %s, 来源: %s)", label, ip, isp_name, url)
+                return ip
         except Exception:
             continue
-    return "获取IP失败"
+    return None
 
-def get_ip_using_python_source_binding(interface_ip, display_name, interface_index):
-    isp_services = get_isp_services_for_interface(interface_index)
-    try:
-        class SourceIPAdapter(requests.adapters.HTTPAdapter):
-            def __init__(self, source_ip, **kwargs):
-                self.source_ip = source_ip
-                super().__init__(**kwargs)
-            def init_poolmanager(self, *args, **kwargs):
-                kwargs['source_address'] = (self.source_ip, 0)
-                return super().init_poolmanager(*args, **kwargs)
-        session = requests.Session()
-        adapter = SourceIPAdapter(interface_ip)
-        session.mount('http://', adapter)
-        session.mount('https://', adapter)
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
-        for url in isp_services:
-            try:
-                response = session.get(url, headers=headers, timeout=10)
-                if response.status_code == 200:
-                    if 'taobao.com' in url or 'ip.cn' in url:
-                        try:
-                            data = response.json()
-                            if 'ip' in data:
-                                ip = data['ip']
-                            elif 'data' in data and 'ip' in data['data']:
-                                ip = data['data']['ip']
-                            else:
-                                continue
-                        except:
-                            continue
-                    else:
-                        ip_match = re.search(ip_pattern, response.text.strip())
-                        if not ip_match:
-                            continue
-                        ip = ip_match.group()
-                    if is_valid_ip(ip):
-                        isp_name = "未知"
-                        for isp, services in IP_SERVICES_BY_ISP.items():
-                            if url in services:
-                                isp_names = {"telecom": "电信", "unicom": "联通", "mobile": "移动", "edu": "教育网", "international": "国际"}
-                                isp_name = isp_names.get(isp, isp)
-                                break
-                        interface_desc = ["电信线路", "联通线路", "移动线路"][interface_index]
-                        log_with_timestamp(f"{interface_desc} {display_name}(Python) IP: {ip} (运营商: {isp_name})")
-                        return ip
-            except Exception:
+
+def get_public_ip_via_requests(source_ip: str, interface_index: int) -> str | None:
+    """通过 Python requests 绑定源 IP 获取公网 IP（curl 失败时的后备方案）"""
+    # 自定义 Adapter 绑定源地址
+    class SourceBindingAdapter(requests.adapters.HTTPAdapter):
+        def __init__(self, src_ip, **kwargs):
+            self._src_ip = src_ip
+            super().__init__(**kwargs)
+
+        def init_poolmanager(self, *args, **kwargs):
+            kwargs["source_address"] = (self._src_ip, 0)
+            return super().init_poolmanager(*args, **kwargs)
+
+    session = requests.Session()
+    adapter = SourceBindingAdapter(source_ip)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+    }
+    services = build_service_list(interface_index)
+    for url, isp_key in services:
+        try:
+            resp = session.get(url, headers=headers, timeout=10)
+            if resp.status_code != 200:
                 continue
-    except Exception as e:
-        log_with_timestamp(f"使用Python绑定获取接口 {display_name} IP失败: {e}")
-    return "获取IP失败"
-
-def is_valid_ip(ip):
-    if ip == "获取IP失败":
-        return False
-    parts = ip.split('.')
-    if len(parts) != 4:
-        return False
-    for part in parts:
-        if not part.isdigit() or not 0 <= int(part) <= 255:
-            return False
-    return True
-
-def is_public_ip(ip):
-    if not is_valid_ip(ip):
-        return False
-    octets = [int(x) for x in ip.split('.')]
-    if octets[0] == 10:
-        return False
-    if octets[0] == 172 and 16 <= octets[1] <= 31:
-        return False
-    if octets[0] == 192 and octets[1] == 168:
-        return False
-    if octets[0] == 127:
-        return False
-    if octets[0] == 169 and octets[1] == 254:
-        return False
-    return True
-
-def CheckIPs():
-    global current_ips
-    log_with_timestamp("开始获取各接口IP地址（电信→联通→移动优先级）...")
-    new_ips = []
-    changed = False
-    for i, interface_config in enumerate(interface_configs):
-        interface_name = interface_config['interface']
-        display_name = f"接口{i+1}"
-        interface_desc = ["电信线路", "联通线路", "移动线路"][i]
-        log_with_timestamp(f"检查{display_name}({interface_desc}) - 网卡: {interface_name}")
-        local_ip = get_interface_ip(interface_name)
-        if not local_ip:
-            log_with_timestamp(f"无法获取{display_name}的本地IP，跳过该接口")
-            new_ips.append("获取IP失败")
+            ip = parse_ip_response(url, resp.text)
+            if ip and is_valid_ip(ip) and is_public_ip(ip):
+                isp_name = ISP_NAMES.get(isp_key, isp_key)
+                label = INTERFACE_LABELS[interface_index]
+                log.info("%s IP (requests): %s (运营商: %s)", label, ip, isp_name)
+                return ip
+        except Exception:
             continue
-        log_with_timestamp(f"{display_name} 本地IP: {local_ip}")
-        ip = get_ip_using_curl_source_binding(local_ip, display_name, i)
-        if ip == "获取IP失败":
-            log_with_timestamp(f"尝试使用Python绑定获取{display_name} IP")
-            ip = get_ip_using_python_source_binding(local_ip, display_name, i)
-        new_ips.append(ip)
-        if ip != "获取IP失败" and ip != current_ips[i]:
-            changed = True
-            log_with_timestamp(f"检测到{display_name} IP变化: {current_ips[i]} → {ip}")
-            current_ips[i] = ip
+    return None
+
+
+def detect_all_interface_ips(interface_configs: list[dict]) -> tuple[bool, list[str | None]]:
+    """
+    检测所有接口的公网 IP。
+    返回 (has_changed, [ip_or_None, ...])
+    """
+    log.info("开始获取各接口IP地址...")
+    new_ips: list[str | None] = []
+
+    for i, iface_cfg in enumerate(interface_configs):
+        iface_name = iface_cfg["interface"]
+        label = INTERFACE_LABELS[i] if i < len(INTERFACE_LABELS) else f"接口{i+1}"
+        log.info("检查 %s - 网卡: %s", label, iface_name)
+
+        local_ip = get_interface_ip(iface_name)
+        if not local_ip:
+            log.warning("无法获取 %s 的内网IP，跳过", label)
+            new_ips.append(None)
+            continue
+
+        log.info("%s 本地IP: %s", label, local_ip)
+
+        # 优先用 curl（更快），失败则用 requests
+        public_ip = get_public_ip_via_curl(local_ip, i)
+        if public_ip is None:
+            log.info("curl 获取失败，尝试 Python requests...")
+            public_ip = get_public_ip_via_requests(local_ip, i)
+
+        if public_ip is None:
+            log.error("%s 公网IP获取失败", label)
+        new_ips.append(public_ip)
+
         if i < len(interface_configs) - 1:
             time.sleep(2)
-    valid_ips = [ip for ip in new_ips if ip != "获取IP失败"]
-    unique_ips = set(valid_ips)
-    if len(valid_ips) > 1 and len(unique_ips) < len(valid_ips):
-        log_with_timestamp("警告：获取到的接口IP有重复，可能未正确区分线路")
-        for ip in unique_ips:
-            count = valid_ips.count(ip)
-            if count > 1:
-                log_with_timestamp(f"IP {ip} 出现了 {count} 次")
-    return changed, new_ips
 
-# ==================== Chrome 浏览器相关函数 ====================
-def setup_chrome_options():
+    # 检查是否有重复 IP（可能表示线路未正确区分）
+    valid = [ip for ip in new_ips if ip]
+    if len(valid) > 1 and len(set(valid)) < len(valid):
+        log.warning("获取到的接口IP有重复，可能未正确区分线路:")
+        for ip in set(valid):
+            count = valid.count(ip)
+            if count > 1:
+                log.warning("  IP %s 出现了 %d 次", ip, count)
+
+    return new_ips
+
+
+# ==================== Chrome 浏览器 ====================
+def setup_chrome_options() -> webdriver.ChromeOptions:
+    """配置 Chrome 选项（headless、精简、安全）"""
     options = webdriver.ChromeOptions()
-    options.add_argument('--headless=new')
-    options.add_argument('--no-sandbox')
-    options.add_argument('--disable-dev-shm-usage')
-    options.add_argument('--disable-gpu')
-    options.add_argument('--disable-extensions')
-    options.add_argument('--disable-plugins')
-    options.add_argument('--disable-images')
-    options.add_argument('--blink-settings=imagesEnabled=false')
-    options.add_argument('--disable-background-timer-throttling')
-    options.add_argument('--disable-backgrounding-occluded-windows')
-    options.add_argument('--disable-renderer-backgrounding')
-    options.add_argument('--memory-pressure-off')
-    options.add_argument('--max_old_space_size=512')
-    options.add_argument('--window-size=1920,1080')
-    options.add_argument('--remote-debugging-port=0')
-    options.add_argument('--user-data-dir=/tmp/chrome-data')
-    options.add_argument('--disable-web-security')
-    options.add_argument('--allow-running-insecure-content')
-    options.add_argument('--disable-features=VizDisplayCompositor')
-    options.add_argument('--disable-software-rasterizer')
-    options.page_load_strategy = 'eager'
-    options.add_experimental_option('excludeSwitches', ['enable-automation', 'enable-logging', 'ignore-certificate-errors'])
-    options.add_experimental_option('prefs', {
-        'profile.default_content_setting_values.notifications': 2,
-        'profile.default_content_settings.popups': 0,
-        'profile.managed_default_content_settings.images': 2,
+    # 基础优化
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-plugins")
+    options.add_argument("--window-size=1920,1080")
+    # 禁用图片加载（加速）
+    options.add_argument("--blink-settings=imagesEnabled=false")
+    # 防止后台节流
+    options.add_argument("--disable-background-timer-throttling")
+    options.add_argument("--disable-backgrounding-occluded-windows")
+    options.add_argument("--disable-renderer-backgrounding")
+    # 页面加载策略
+    options.page_load_strategy = "eager"
+    # 隐藏自动化标记
+    options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
+    options.add_experimental_option("prefs", {
+        "profile.default_content_setting_values.notifications": 2,
+        "profile.default_content_settings.popups": 0,
+        "profile.managed_default_content_settings.images": 2,
     })
     return options
 
-def create_chrome_service():
-    service = Service()
-    return service
 
 def cleanup_chrome_processes():
-    try:
-        subprocess.run(['pkill', '-f', 'chrome'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.run(['pkill', '-f', 'chromedriver'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(1)
-    except Exception as e:
-        log_with_timestamp(f"清理Chrome进程时出错: {e}")
-
-# ==================== 全局状态变量（用于错误限流和恢复）====================
-last_error_time = None          # 上次错误报告时间
-last_recovery_time = None       # 上次恢复通知时间
-error_reported_for_failure = False  # 当前连续失败周期中是否已发送过错误报告
-last_cycle_success = True            # 上一次完整周期是否成功（初始为True避免刚启动就发恢复）
-
-# ==================== 带限流的错误/恢复通知 ====================
-def send_error_report(error_message):
-    """发送错误报告到Webhook，24小时内只发送一次"""
-    global last_error_time
-    if not webhook_url:
-        log_with_timestamp("Webhook URL未配置，跳过错误报告")
-        return
-    current_time = datetime.now()
-    if last_error_time and (current_time - last_error_time).total_seconds() < 86400:
-        log_with_timestamp("24小时内已发送过错误报告，本次跳过")
-        return
-    payload = {
-        "msgtype": "text",
-        "text": {
-            "content": f"企业微信IP更新器发生错误:\n{error_message}\n时间: {current_time.strftime('%Y-%m-%d %H:%M:%S')}"
-        }
-    }
-    try:
-        response = requests.post(webhook_url, json=payload, headers={'Content-Type': 'application/json'}, timeout=10)
-        if response.status_code == 200:
-            log_with_timestamp("✅ 错误报告发送成功")
-            last_error_time = current_time
-        else:
-            log_with_timestamp(f"⚠️ 错误报告发送失败，状态码: {response.status_code}")
-    except Exception as e:
-        log_with_timestamp(f"❌ 发送错误报告时出错: {e}")
-
-def send_recovery_report():
-    """发送恢复通知到 Webhook，24小时内只发送一次"""
-    global last_recovery_time
-    if not webhook_url:
-        log_with_timestamp("Webhook URL未配置，跳过恢复通知")
-        return
-    current_time = datetime.now()
-    if last_recovery_time and (current_time - last_recovery_time).total_seconds() < 86400:
-        log_with_timestamp("24小时内已发送过恢复通知，本次跳过")
-        return
-    payload = {
-        "msgtype": "text",
-        "text": {
-            "content": f"✅ 企业微信 IP 更新器已恢复\n\n⏰ 时间：{current_time.strftime('%Y-%m-%d %H:%M:%S')}\n\n系统状态：正常"
-        }
-    }
-    try:
-        response = requests.post(webhook_url, json=payload, headers={'Content-Type': 'application/json'}, timeout=10)
-        if response.status_code == 200:
-            log_with_timestamp("✅ 恢复通知发送成功")
-            last_recovery_time = current_time
-        else:
-            log_with_timestamp(f"⚠️ 恢复通知发送失败，状态码：{response.status_code}")
-    except Exception as e:
-        log_with_timestamp(f"❌ 发送恢复通知时出错：{e}")
-
-# ==================== 企业微信 IP 修改函数 ====================
-def ChangeIP(driver, new_ips):
-    """更新企业微信可信IP地址，返回 (success, error_message)"""
-    try:
-        log_with_timestamp("尝试更改企业微信可信IP地址")
-        valid_ips = [ip for ip in new_ips if ip != "获取IP失败" and not ip.startswith(('192.168.', '10.', '172.16.', '172.17.', '172.18.', '172.19.', '172.20.', '172.21.', '172.22.', '172.23.', '172.24.', '172.25.', '172.26.', '172.27.', '172.28.', '172.29.', '172.30.', '172.31.', '127.0.0.', '169.254.'))]
-        unique_ips = []
-        seen_ips = set()
-        for ip in valid_ips:
-            if ip not in seen_ips:
-                unique_ips.append(ip)
-                seen_ips.add(ip)
-        if not unique_ips:
-            return False, "没有有效的公网IP地址可以设置（所有IP都是私有IP或本地回环）"
-        new_ips_str = ';'.join(unique_ips)
-        if len(unique_ips) < len(valid_ips):
-            log_with_timestamp(f"检测到重复IP，去重后设置: {new_ips_str} (原始: {len(valid_ips)}个 → 唯一: {len(unique_ips)}个)")
-        
-        settings_button = WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable((By.XPATH, '//div[contains(@class, "app_card_operate") and contains(@class, "js_show_ipConfig_dialog")]'))
-        )
-        driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", settings_button)
-        time.sleep(0.5)
-        driver.execute_script("arguments[0].click();", settings_button)
-        log_with_timestamp("已点击设置按钮")
-        
-        input_area = WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable((By.XPATH, '//textarea[contains(@class, "js_ipConfig_textarea")]'))
-        )
-        current_ips_str = input_area.get_attribute('value').strip()
-        log_with_timestamp(f"当前已设置IP: {current_ips_str}")
-        log_with_timestamp(f"准备设置新IP: {new_ips_str}")
-        
-        driver.execute_script("arguments[0].value = '';", input_area)
-        input_area.send_keys(new_ips_str)
-        log_with_timestamp(f"已设置新IP: {new_ips_str}")
-        
-        confirm_button = WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable((By.XPATH, '//a[contains(@class, "js_ipConfig_confirmBtn")]'))
-        )
-        driver.execute_script("arguments[0].click();", confirm_button)
-        log_with_timestamp("已提交IP变更")
-        
-        WebDriverWait(driver, 5).until(
-            EC.invisibility_of_element_located((By.XPATH, '//div[contains(@class, "js_ipConfig_dialog")]'))
-        )
-        log_with_timestamp("✅ IP地址更新成功")
-        return True, ""
-    except Exception as e:
-        error_msg = f"更改IP地址失败: {e}"
-        log_with_timestamp(error_msg)
+    """清理残留 Chrome 进程"""
+    for pattern in ["chrome", "chromedriver", "chromium"]:
         try:
-            timestamp = time.strftime("%Y%m%d-%H%M%S")
-            filename = f"error_{timestamp}.png"
-            driver.save_screenshot(filename)
-            log_with_timestamp(f"已保存错误截图: {filename}")
-            error_msg += f"\n已保存截图: {filename}"
-        except:
+            subprocess.run(
+                ["pkill", "-f", pattern],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except Exception:
             pass
-        return False, error_msg
+    time.sleep(1)
 
-# ==================== 浏览器启动函数（带重试） ====================
-def OpenBrowser():
-    """启动浏览器并访问企业微信，成功返回driver，失败返回None（内部重试3次）"""
-    log_with_timestamp("启动Chrome浏览器访问企业微信")
+
+def launch_browser(wechat_url: str, cookie_header: str) -> webdriver.Chrome | None:
+    """
+    启动浏览器并访问企业微信，应用 cookie 完成登录。
+    失败时内部重试 CHROME_MAX_RETRIES 次。
+    """
+    log.info("启动Chrome浏览器访问企业微信")
+
     for attempt in range(CHROME_MAX_RETRIES):
-        start_time = time.time()
         driver = None
+        start_time = time.time()
         try:
             if attempt > 0:
                 cleanup_chrome_processes()
-                log_with_timestamp(f"第 {attempt + 1} 次尝试启动浏览器...")
+                log.info("第 %d 次尝试启动浏览器...", attempt + 1)
+
             options = setup_chrome_options()
-            service = create_chrome_service()
-            log_with_timestamp("正在初始化Chrome驱动...")
+            service = Service()
             driver = webdriver.Chrome(service=service, options=options)
-            log_with_timestamp(f"Chrome驱动初始化完成，耗时: {time.time() - start_time:.2f}秒")
             driver.set_page_load_timeout(15)
             driver.set_script_timeout(10)
             driver.implicitly_wait(5)
-            log_with_timestamp(f"访问URL: {wechatUrl}")
-            driver.get(wechatUrl)
-            WebDriverWait(driver, 8).until(EC.presence_of_element_located((By.TAG_NAME, 'body')))
-            log_with_timestamp(f"页面加载完成，总耗时: {time.time() - start_time:.2f}秒")
-            # 应用cookies
-            try:
-                driver.delete_all_cookies()
-                cookies = cookie_header.split(';')
-                for cookie in cookies:
-                    if '=' in cookie:
-                        name, value = cookie.split('=', 1)
-                        cookie_dict = {
-                            "name": name.strip(),
-                            "value": value.strip(),
-                            "domain": ".work.weixin.qq.com",
-                            "path": "/",
-                        }
-                        if wechatUrl.startswith('https'):
-                            cookie_dict["secure"] = True
-                        driver.add_cookie(cookie_dict)
-                log_with_timestamp("重新加载页面应用cookies")
-                driver.refresh()
-                time.sleep(1)
-            except Exception as e:
-                log_with_timestamp(f"应用cookies异常: {e}")
-                raise
+
+            log.info("Chrome驱动初始化完成 (%.1fs)", time.time() - start_time)
+            driver.get(wechat_url)
+            WebDriverWait(driver, 8).until(
+                EC.presence_of_element_located((By.TAG_NAME, "body"))
+            )
+
+            # 应用 cookies
+            driver.delete_all_cookies()
+            for part in cookie_header.split(";"):
+                if "=" not in part:
+                    continue
+                name, value = part.split("=", 1)
+                cookie_dict = {
+                    "name": name.strip(),
+                    "value": value.strip(),
+                    "domain": ".work.weixin.qq.com",
+                    "path": "/",
+                }
+                if wechat_url.startswith("https"):
+                    cookie_dict["secure"] = True
+                driver.add_cookie(cookie_dict)
+
+            log.info("应用cookies，重新加载页面")
+            driver.refresh()
+            time.sleep(1)
+
             # 检查登录状态
             try:
-                WebDriverWait(driver, 3).until(EC.presence_of_element_located((By.CLASS_NAME, 'login_stage_title_text')))
-                raise Exception("登录状态失效，请更新cookie")
+                WebDriverWait(driver, 3).until(
+                    EC.presence_of_element_located((By.CLASS_NAME, "login_stage_title_text"))
+                )
+                raise RuntimeError("登录状态失效，请更新cookie")
             except TimeoutException:
-                log_with_timestamp("登录状态验证成功")
+                log.info("登录状态验证成功")
+
+            log.info("浏览器启动完成，总耗时 %.1fs", time.time() - start_time)
             return driver
+
         except Exception as e:
-            error_msg = f"浏览器启动或页面加载异常(尝试 {attempt+1}/{CHROME_MAX_RETRIES}): {str(e)}"
-            log_with_timestamp(error_msg)
+            log.error("浏览器启动异常 (%d/%d): %s", attempt + 1, CHROME_MAX_RETRIES, e)
             if driver:
                 try:
                     driver.quit()
-                except:
+                except Exception:
                     pass
-            if attempt == CHROME_MAX_RETRIES - 1:
-                return None
-            else:
-                wait_time = CHROME_RETRY_DELAY * (attempt + 1)
-                log_with_timestamp(f"等待 {wait_time} 秒后重试...")
-                time.sleep(wait_time)
+            if attempt < CHROME_MAX_RETRIES - 1:
+                wait = CHROME_RETRY_DELAY * (attempt + 1)
+                log.info("等待 %d 秒后重试...", wait)
+                time.sleep(wait)
+
     return None
+
+
+# ==================== 企业微信 IP 更新 ====================
+def update_wecom_ip(driver: webdriver.Chrome, new_ips: list[str | None]) -> tuple[bool, str]:
+    """
+    更新企业微信可信 IP 地址。
+    返回 (success, error_message)
+    """
+    try:
+        # 过滤有效公网 IP 并去重
+        valid_ips = []
+        seen = set()
+        for ip in new_ips:
+            if ip and is_public_ip(ip) and ip not in seen:
+                valid_ips.append(ip)
+                seen.add(ip)
+
+        if not valid_ips:
+            return False, "没有有效的公网IP地址可以设置"
+
+        new_ips_str = ";".join(valid_ips)
+        log.info("准备设置可信IP: %s", new_ips_str)
+
+        # 点击设置按钮
+        settings_btn = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((
+                By.XPATH,
+                '//div[contains(@class, "app_card_operate") and contains(@class, "js_show_ipConfig_dialog")]',
+            ))
+        )
+        driver.execute_script("arguments[0].scrollIntoView({behavior:'smooth',block:'center'});", settings_btn)
+        time.sleep(0.5)
+        driver.execute_script("arguments[0].click();", settings_btn)
+        log.info("已点击设置按钮")
+
+        # 填写 IP
+        textarea = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((By.XPATH, '//textarea[contains(@class, "js_ipConfig_textarea")]'))
+        )
+        old_ips_str = textarea.get_attribute("value").strip()
+        log.info("当前已设置IP: %s", old_ips_str)
+
+        driver.execute_script("arguments[0].value = '';", textarea)
+        textarea.send_keys(new_ips_str)
+
+        # 确认
+        confirm_btn = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((By.XPATH, '//a[contains(@class, "js_ipConfig_confirmBtn")]'))
+        )
+        driver.execute_script("arguments[0].click();", confirm_btn)
+        log.info("已提交IP变更")
+
+        # 等待对话框关闭
+        WebDriverWait(driver, 5).until(
+            EC.invisibility_of_element_located((By.XPATH, '//div[contains(@class, "js_ipConfig_dialog")]'))
+        )
+        log.info("IP地址更新成功: %s", new_ips_str)
+        return True, ""
+
+    except Exception as e:
+        error_msg = f"更改IP地址失败: {e}"
+        log.error(error_msg)
+        # 保存截图
+        try:
+            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+            path = f"error_{ts}.png"
+            driver.save_screenshot(path)
+            log.info("错误截图已保存: %s", path)
+            error_msg += f"\n截图: {path}"
+        except Exception:
+            pass
+        return False, error_msg
+
+
+# ==================== Webhook 通知 ====================
+class Notifier:
+    """带限流的 Webhook 通知器"""
+
+    def __init__(self, webhook_url: str):
+        self.webhook_url = webhook_url
+        self._last_error_time: datetime | None = None
+        self._last_recovery_time: datetime | None = None
+        self._error_sent_for_current_failure = False
+        self._last_cycle_ok = True  # 初始 True，避免启动就发恢复通知
+
+    def _post(self, content: str) -> bool:
+        if not self.webhook_url:
+            return False
+        try:
+            resp = requests.post(
+                self.webhook_url,
+                json={"msgtype": "text", "text": {"content": content}},
+                headers={"Content-Type": "application/json"},
+                timeout=10,
+            )
+            return resp.status_code == 200
+        except Exception as e:
+            log.error("Webhook 发送失败: %s", e)
+            return False
+
+    def report_error(self, message: str):
+        """发送错误通知（24h 内同一故障周期只发一次）"""
+        now = datetime.now()
+        if self._last_error_time and (now - self._last_error_time).total_seconds() < NOTIFICATION_COOLDOWN:
+            log.info("24h内已发送过错误报告，跳过")
+            return
+        ts = now.strftime("%Y-%m-%d %H:%M:%S")
+        ok = self._post(f"企业微信IP更新器发生错误:\n{message}\n时间: {ts}")
+        if ok:
+            log.info("错误报告发送成功")
+            self._last_error_time = now
+            self._error_sent_for_current_failure = True
+        else:
+            log.warning("错误报告发送失败")
+
+    def report_recovery(self):
+        """发送恢复通知"""
+        now = datetime.now()
+        if self._last_recovery_time and (now - self._last_recovery_time).total_seconds() < NOTIFICATION_COOLDOWN:
+            return
+        ts = now.strftime("%Y-%m-%d %H:%M:%S")
+        ok = self._post(f"企业微信 IP 更新器已恢复\n\n时间：{ts}\n\n系统状态：正常")
+        if ok:
+            log.info("恢复通知发送成功")
+            self._last_recovery_time = now
+
+    def on_cycle_result(self, cycle_ok: bool, error_detail: str = ""):
+        """根据周期结果决定通知策略"""
+        if cycle_ok:
+            if not self._last_cycle_ok:
+                log.info("从故障中恢复")
+                self.report_recovery()
+                self._error_sent_for_current_failure = False
+            self._last_cycle_ok = True
+        else:
+            if not self._error_sent_for_current_failure:
+                self.report_error(error_detail)
+            self._last_cycle_ok = False
+
 
 # ==================== 主循环 ====================
 def main():
-    global current_ips, error_reported_for_failure, last_cycle_success
-    log_with_timestamp("企业微信三接口IP更新器启动（电信→联通→移动优先级）")
-    for i, config in enumerate(interface_configs):
-        log_with_timestamp(f"接口{i+1} - 网卡: {config['interface']}")
-    if not check_curl_available():
-        log_with_timestamp("错误：curl命令不可用")
-        send_error_report("curl命令不可用")
+    config = load_config()
+    settings = config["Settings"]
+
+    interface_configs = [
+        {"interface": settings[f"interface{i+1}_interface"]}
+        for i in range(3)
+    ]
+    wechat_url = settings["wechatUrl"]
+    cookie_header = settings["cookie_header"]
+    interval = settings["detailsTime"]
+    webhook_url = settings.get("webhook_url", "")
+
+    notifier = Notifier(webhook_url)
+    current_ips: list[str | None] = [None, None, None]
+
+    log.info("企业微信三接口IP更新器启动")
+    for i, cfg in enumerate(interface_configs):
+        log.info("  接口%d (%s) - 网卡: %s", i + 1, INTERFACE_LABELS[i], cfg["interface"])
+
+    # 检查 curl
+    try:
+        subprocess.run(["curl", "--version"], capture_output=True, timeout=5)
+    except Exception:
+        log.error("curl 命令不可用，程序退出")
+        notifier.report_error("curl命令不可用")
         return
+
     while True:
         driver = None
-        cycle_success = False
+        cycle_ok = False
         error_detail = ""
+        start_time = time.time()
+
         try:
-            start_time = time.time()
-            driver = OpenBrowser()
+            driver = launch_browser(wechat_url, cookie_header)
             if not driver:
                 error_detail = "浏览器启动失败（重试3次后仍失败）"
-                log_with_timestamp(error_detail)
-                cycle_success = False
+                log.error(error_detail)
             else:
                 try:
-                    changed, new_ips = CheckIPs()
+                    new_ips = detect_all_interface_ips(interface_configs)
                 except Exception as e:
-                    error_detail = f"IP检测过程发生异常: {e}"
-                    log_with_timestamp(error_detail)
-                    changed = False
-                    cycle_success = False
+                    error_detail = f"IP检测异常: {e}"
+                    log.error(error_detail)
                 else:
+                    # 判断是否有变化
+                    changed = any(
+                        new_ip is not None and new_ip != current_ips[i]
+                        for i, new_ip in enumerate(new_ips)
+                    )
                     if changed:
-                        log_with_timestamp("检测到IP变化，开始更新企业微信设置")
-                        success, err_msg = ChangeIP(driver, new_ips)
-                        if success:
-                            cycle_success = True
-                            log_with_timestamp("IP变更成功")
+                        log.info("检测到IP变化，开始更新企业微信")
+                        ok, err = update_wecom_ip(driver, new_ips)
+                        if ok:
+                            # 更新缓存
+                            for i, ip in enumerate(new_ips):
+                                if ip is not None:
+                                    current_ips[i] = ip
+                            cycle_ok = True
+                            log.info("IP变更成功")
                         else:
-                            cycle_success = False
-                            error_detail = err_msg
-                            log_with_timestamp(f"IP变更失败: {error_detail}")
+                            error_detail = err
+                            log.error("IP变更失败: %s", err)
                     else:
-                        cycle_success = True
-                        log_with_timestamp("所有接口IP均未发生变化，无需更新")
-            # 处理成功/失败通知
-            if cycle_success:
-                if not last_cycle_success:
-                    log_with_timestamp("从故障中恢复，发送恢复通知")
-                    send_recovery_report()
-                    error_reported_for_failure = False  # 重置错误标记
-                last_cycle_success = True
-            else:
-                if not error_reported_for_failure:
-                    send_error_report(error_detail)
-                    error_reported_for_failure = True
-                last_cycle_success = False
-            # 等待下一个周期
-            loop_duration = time.time() - start_time
-            log_with_timestamp(f"本次循环总耗时: {loop_duration:.2f}秒")
-            log_with_timestamp(f"等待 {detailsTime} 秒后进行下一次检查...")
-            time.sleep(detailsTime)
+                        cycle_ok = True
+                        log.info("所有接口IP均未变化，无需更新")
+
+            notifier.on_cycle_result(cycle_ok, error_detail)
+
         except Exception as e:
-            error_detail = f"主循环未捕获异常: {e}"
-            log_with_timestamp(error_detail)
-            if not error_reported_for_failure:
-                send_error_report(error_detail)
-                error_reported_for_failure = True
-            last_cycle_success = False
-            time.sleep(detailsTime)
+            error_detail = f"主循环异常: {e}"
+            log.error(error_detail)
+            notifier.on_cycle_result(False, error_detail)
+
         finally:
             if driver:
                 try:
                     driver.quit()
-                    cleanup_chrome_processes()
-                except:
+                except Exception:
                     pass
+                cleanup_chrome_processes()
+
+        elapsed = time.time() - start_time
+        log.info("本次循环耗时 %.1fs，等待 %ds 后下次检查...", elapsed, interval)
+        time.sleep(interval)
+
 
 if __name__ == "__main__":
     main()
