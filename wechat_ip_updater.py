@@ -379,22 +379,29 @@ def detect_all_interface_ips(interface_configs: list[dict]) -> tuple[bool, list[
 
 # ==================== Chrome 浏览器 ====================
 def setup_chrome_options() -> webdriver.ChromeOptions:
-    """配置 Chrome 选项（headless、精简、安全）"""
+    """配置 Chrome 选项（headless、低内存）"""
     options = webdriver.ChromeOptions()
-    # 基础优化
+    # 基础：headless + 无沙箱
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
+    # 精简：禁用一切不需要的功能
     options.add_argument("--disable-extensions")
     options.add_argument("--disable-plugins")
-    options.add_argument("--window-size=1920,1080")
-    # 禁用图片加载（加速）
+    options.add_argument("--disable-images")
     options.add_argument("--blink-settings=imagesEnabled=false")
-    # 防止后台节流
-    options.add_argument("--disable-background-timer-throttling")
-    options.add_argument("--disable-backgrounding-occluded-windows")
-    options.add_argument("--disable-renderer-backgrounding")
+    options.add_argument("--disable-application-cache")
+    options.add_argument("--disable-add-to-shelf")
+    options.add_argument("--disable-client-side-phishing-detection")
+    options.add_argument("--disable-default-apps")
+    options.add_argument("--disable-translate")
+    # 内存限制
+    options.add_argument("--js-flags=--max-old-space-size=256")
+    options.add_argument("--single-process")
+    options.add_argument("--no-zygote")
+    # 窗口缩小（减少渲染内存）
+    options.add_argument("--window-size=1280,720")
     # 页面加载策略
     options.page_load_strategy = "eager"
     # 隐藏自动化标记
