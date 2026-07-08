@@ -331,7 +331,7 @@ def get_public_ip_via_requests(source_ip: str, interface_index: int) -> str | No
     return None
 
 
-def detect_all_interface_ips(interface_configs: list[dict]) -> tuple[bool, list[str | None]]:
+def detect_all_interface_ips(interface_configs: list[dict]) -> list[str | None]:
     """
     检测所有接口的公网 IP。
     返回 (has_changed, [ip_or_None, ...])
