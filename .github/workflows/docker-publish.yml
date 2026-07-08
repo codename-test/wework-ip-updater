@@ -1,42 +1,82 @@
-name: Build and Push Docker Image
+name: Docker Build & Push
 
 on:
   push:
-    tags:
-      - 'v*' # 推送以 'v' 开头的标签时触发，例如 v1.0.0
-    branches:
-      - main # 推送到 main 分支时也触发（可选，根据你的发布习惯）
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+env:
+  GHCR_IMAGE: ghcr.io/${{ github.repository }}
+  DH_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/wework-ip-updater
 
 jobs:
-  build-and-push:
+  build:
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+
     steps:
-      # 1. 检出仓库代码
-      - name: Checkout code
-        uses: actions/checkout@v7
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      # 2. 设置 Docker 构建环境
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@v3
 
-      # 3. 登录到 GitHub Container Registry
       - name: Log in to GHCR
-        uses: docker/login-action@v4
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 4. 构建并推送 Docker 镜像
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v6
+      - name: Log in to Docker Hub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Docker meta (GHCR)
+        id: meta-ghcr
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.GHCR_IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha,prefix=,format=short
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Docker meta (Docker Hub)
+        id: meta-dh
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.DH_IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha,prefix=,format=short
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
         with:
           context: .
-          push: true
+          file: dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
           tags: |
-            ghcr.io/codename-test/wework-ip-updater:latest
-            ghcr.io/codename-test/wework-ip-updater:${{ github.ref_name }}
-          labels: ${{ steps.meta.outputs.labels }}
+            ${{ steps.meta-ghcr.outputs.tags }}
+            ${{ steps.meta-dh.outputs.tags }}
+          labels: |
+            ${{ steps.meta-ghcr.outputs.labels }}
+            ${{ steps.meta-dh.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
